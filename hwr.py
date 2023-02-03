@@ -1,7 +1,7 @@
 from __future__ import annotations
 from abc import abstractmethod as abstract, ABC as Abstract
 from typing import Callable, Union, Any
-from sympy import symbols, Symbol, Add, solve, Eq, Piecewise, Ge
+from sympy import symbols, Symbol, Add, solve, Eq
 
 number = Union[float, int]
 
@@ -10,13 +10,13 @@ class Component(Abstract):
     CURRNUM: int
 
     def __init__(self, name):
-        self.name = name
-        self.terminals = {}
-        self.id = None
-        self.settings = {}
-        self.potentials = [None] * self.TERMNUM
-        self.currents = []
-        self.aux = []
+        self.name: str = name
+        self.terminals: dict[str, int] = {}
+        self.id: Union[int, None] = None
+        self.settings: dict[str, Any] = {}
+        self.potentials: list[Symbol] = [Symbol("undefined")] * self.TERMNUM
+        self.currents: list[Symbol] = []
+        self.aux: list[Symbol] = []
     
     def set_id(self, i: int):
         self.id = i
@@ -98,28 +98,6 @@ class CurrentSource(Component):
             case CurrentSource.PLUS: return [1]
             case CurrentSource.MINUS: return [-1]
 
-class Diode(Component):
-    TERMNUM = 2
-    CURRNUM = 1
-    PLUS = 0
-    MINUS = 1
-
-    def init_aux_vars(self):
-        self.aux = [Symbol(str(id(self)) + "0", nonnegative=True)]
-        return self.aux
-
-    def invariants(self, t):
-        # TODO: implement way to adjust this curve.
-        r = Piecewise((10e-15, Ge(self.currents[0], 0)), (10e15, True))
-        return [
-            Eq(self.potentials[Diode.PLUS], self.potentials[Diode.MINUS] + self.currents[0] * r)
-        ]
-
-    def terminal_currents(self, t):
-        match t:
-            case Diode.PLUS: return [-1]
-            case Diode.MINUS: return [1]
-
 class Ground(Component):
     TERMNUM = 1
     CURRNUM = 1
@@ -133,7 +111,7 @@ class Ground(Component):
     def terminal_currents(self, t):
         return [-1]
 
-def build(t: number, short: list[list[tuple[Component, int]]], *objects: Component) -> tuple[list[list[number]], list[number]]:
+def build(t: number, short: list[list[tuple[Component, int]]], *objects: Component):
     potentials = symbols(f"φ(1:{len(short) + 1})", real=True)
     currents = symbols(f"I(1:{sum(map(lambda cmp: cmp.CURRNUM, objects)) + 1})", real=True)
     aux_vars = []
@@ -154,3 +132,22 @@ def build(t: number, short: list[list[tuple[Component, int]]], *objects: Compone
     for object in objects:
         equations.extend(object.invariants(t))
     return solve(equations, potentials + tuple(currents) + tuple(aux_vars))
+
+if __name__ == "__main__":
+    Uq = VoltageSource("U").voltage(5)
+    R1 = Resistor("R1").resistance(2)
+    R2 = Resistor("R2").resistance(10)
+    R3 = Resistor("R3").resistance(8)
+    GND = Ground("GND")
+
+    wires = [
+        [ (Uq, VoltageSource.PLUS), (R1, Resistor.T0) ],
+        [ (R1, Resistor.T1), (R2, Resistor.T0), (R3, Resistor.T0) ],
+        [ (R2, Resistor.T1), (R3, Resistor.T1), (GND, Ground.T), (Uq, VoltageSource.MINUS) ]
+    ]
+
+    sol: list[number] = list(build(0, wires, Uq, R1, R2, R3, GND).values())
+    print("U_Q: %.3f" % (sol[0] - sol[2]))
+    print("U_1: %.3f" % (sol[0] - sol[1]))
+    print("U_23: %.3f" % (sol[1] - sol[2]))
+    print("I: %.3f" % sol[3])
