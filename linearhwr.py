@@ -1,35 +1,31 @@
 from __future__ import annotations
 from abc import abstractmethod as abstract, ABC as Abstract
 from typing import Callable, Union, Any
-from sympy import symbols, Symbol, Add, solve, Eq
+import numpy as np
 
-number = Union[float, int]
+number = float | int
 
 class Component(Abstract):
     TERMNUM: int
     CURRNUM: int
 
-    def __init__(self, name):
+    def __init__(self, name: str):
         self.name: str = name
         self.terminals: dict[str, int] = {}
-        self.id: Union[int, None] = None
+        self.id: int | None = None
         self.settings: dict[str, Any] = {}
-        self.potentials: list[Symbol] = [Symbol("undefined")] * self.TERMNUM
-        self.currents: list[Symbol] = []
-        self.aux: list[Symbol] = []
+        self.potentials: list[int] = [-1] * self.TERMNUM
+        self.currents: list[int] = [-1] * self.CURRNUM
     
     def set_id(self, i: int):
         self.id = i
-    
-    def init_aux_vars(self):
-        return self.aux
 
     @abstract
-    def invariants(self, t: number) -> list[Any]:
+    def null(self, t: number) -> list[tuple[Any, list[Any], list[Any]]]:
         pass
 
     @abstract
-    def terminal_currents(self, t: int) -> list[number]:
+    def terminal_currents(self, ter: int) -> list[number]:
         pass
 
 class Resistor(Component):
@@ -38,19 +34,23 @@ class Resistor(Component):
     T0 = 0
     T1 = 1
 
-    def resistance(self, ohm: number):
-        self.settings["resistance"] = ohm
+    def resistance(self, ohm: Callable[[number], number] | number):
+        if isinstance(ohm, number):
+            self.settings["resistance"] = lambda t: ohm  # type: ignore
+        else:
+            self.settings["resistance"] = ohm
         return self
     
-    def invariants(self, t):
+    def null(self, t: number):
         return [
-            Eq(self.potentials[Resistor.T0], self.potentials[Resistor.T1] + self.currents[0] * self.settings["resistance"])
+            (0, [1, -1], [-self.settings["resistance"](t)])
         ]
     
-    def terminal_currents(self, t):
-        match t:
+    def terminal_currents(self, ter: int) -> list[number]:
+        match ter:
             case Resistor.T0: return [-1]
             case Resistor.T1: return [1]
+            case _: raise ValueError()
 
 class VoltageSource(Component):
     TERMNUM = 2
@@ -60,20 +60,21 @@ class VoltageSource(Component):
 
     def voltage(self, volt: Union[Callable[[number], number], number]):
         if isinstance(volt, number):
-            self.settings["voltage"] = lambda t: volt
+            self.settings["voltage"] = lambda t: volt  # type: ignore
         else:
             self.settings["voltage"] = volt
         return self
 
-    def invariants(self, t):
+    def null(self, t: number):
         return [
-            Eq(self.potentials[VoltageSource.PLUS], self.potentials[VoltageSource.MINUS] + self.settings["voltage"](t))
+            (self.settings["voltage"](t), [1, -1], [0])
         ]
     
-    def terminal_currents(self, t):
-        match t:
+    def terminal_currents(self, ter: int) -> list[number]:
+        match ter:
             case VoltageSource.PLUS: return [1]
             case VoltageSource.MINUS: return [-1]
+            case _: raise ValueError()
 
 class CurrentSource(Component):
     TERMNUM = 2
@@ -83,34 +84,36 @@ class CurrentSource(Component):
 
     def current(self, curr: Union[Callable[[number], number], number]):
         if isinstance(curr, number):
-            self.settings["current"] = lambda t: curr
+            self.settings["current"] = lambda t: curr  # type: ignore
         else:
             self.settings["current"] = curr
         return self
 
-    def invariants(self, t):
+    def null(self, t: number):
         return [
-            Eq(self.currents[0], self.settings["current"](t))
+            (self.settings["current"], [0, 0], [1])
         ]
 
-    def terminal_currents(self, t):
-        match t:
+    def terminal_currents(self, ter: int) -> list[number]:
+        match ter:
             case CurrentSource.PLUS: return [1]
             case CurrentSource.MINUS: return [-1]
+            case _: raise ValueError()
 
 class Ground(Component):
     TERMNUM = 1
     CURRNUM = 1
     T = 0
 
-    def invariants(self, t):
+    def null(self, t: number):
         return [
-            Eq(self.potentials[Ground.T], 0)
+            (0, [1], [0])
         ]
 
-    def terminal_currents(self, t):
+    def terminal_currents(self, ter: number) -> list[number]:
         return [-1]
 
+"""
 def build(t: number, short: list[list[tuple[Component, int]]], *objects: Component):
     potentials = symbols(f"φ(1:{len(short) + 1})", real=True)
     currents = symbols(f"I(1:{sum(map(lambda cmp: cmp.CURRNUM, objects)) + 1})", real=True)
@@ -132,6 +135,37 @@ def build(t: number, short: list[list[tuple[Component, int]]], *objects: Compone
     for object in objects:
         equations.extend(object.invariants(t))
     return solve(equations, potentials + tuple(currents) + tuple(aux_vars))
+"""
+def build(t: number, short: list[list[tuple[Component, int]]], *objects: Component):
+    n_pot = len(short)
+    n_cur = sum(map(lambda o: o.CURRNUM, objects))
+    n = n_pot + n_cur
+    c = 0
+    for object in objects:
+        object.currents = [n_pot + c + k for k in range(object.CURRNUM)]
+        c += object.CURRNUM
+    eq: Callable[[], list[number]] = lambda : [0] * n
+    equations: list[list[number]] = []
+    b: list[number] = [0] * len(short)
+    for potential, s in enumerate(short):
+        node_equation = eq()
+        for component, terminal in s:
+            component.potentials[terminal] = potential
+            polarization = component.terminal_currents(terminal)
+            for num, cur in enumerate(component.currents):
+                node_equation[cur] = polarization[num]
+        equations.append(node_equation)
+    for object in objects:
+        for const, pots, curs in object.null(t):
+            mesh_equation = eq()
+            b.append(const)
+            for pot, val in enumerate(pots):
+                mesh_equation[object.potentials[pot]] = val
+            for cur, val in enumerate(curs):
+                mesh_equation[object.currents[cur]] = val
+            equations.append(mesh_equation)
+    return np.linalg.solve(equations, b)
+
 
 if __name__ == "__main__":
     Uq = VoltageSource("U").voltage(5)
@@ -146,8 +180,6 @@ if __name__ == "__main__":
         [ (R2, Resistor.T1), (R3, Resistor.T1), (GND, Ground.T), (Uq, VoltageSource.MINUS) ]
     ]
 
-    sol: list[number] = list(build(0, wires, Uq, R1, R2, R3, GND).values())
-    print("U_Q: %.3f" % (sol[0] - sol[2]))
-    print("U_1: %.3f" % (sol[0] - sol[1]))
-    print("U_23: %.3f" % (sol[1] - sol[2]))
-    print("I: %.3f" % sol[3])
+    sol = build(0, wires, Uq, R1, R2, R3, GND)
+    print(sol)
+    print(sol[Uq.currents[0]])
