@@ -230,21 +230,25 @@ class PMOS(Component):
             case NMOS.G: return [0, 1]
             case _: raise ValueError()
 
-def build(t: number, short: list[list[tuple[Component, int]]], *objects: Component) -> dict[Any, Any]:
+def simulate(t: number, short: list[list[tuple[Component, int]]], *objects: Component, constraints: Callable[[], list[Relational]] | None = None, sym: list[Symbol] | None = None, start_factor: number | None = None) -> dict[Any, Any]:
     potentials = symbols(f"φ(1:{len(short) + 1})", real=True)
     currents = symbols(f"I(1:{sum(map(lambda cmp: cmp.CURRNUM, objects)) + 1})", real=True)
     aux_vars: list[Symbol] = []
+    syms = potentials + tuple(currents) + tuple(aux_vars)
+    if sym: syms += tuple(sym)
     c = 0
     for object in objects:
         aux_vars.extend(object.init_aux_vars())
         object.currents = currents[c:c + object.CURRNUM]
         c += object.CURRNUM
-    syms = potentials + tuple(currents) + tuple(aux_vars)
-    equations: list[Relational] = []
     for var, s in enumerate(short):
+        for component, terminal in s:
+            component.potentials[terminal] = potentials[var]
+    equations: list[Relational] = []
+    if constraints: equations.extend(constraints())
+    for s in short:
         node_equation: list[Expr] = []
         for cmp, term in s:
-            cmp.potentials[term] = potentials[var]
             cmp_currents = cmp.terminal_currents(term)
             for k in range(cmp.CURRNUM):
                 node_equation.append(cast(Expr, cmp_currents[k] * cmp.currents[k]))
@@ -255,11 +259,11 @@ def build(t: number, short: list[list[tuple[Component, int]]], *objects: Compone
             equations.extend(invs)
         else:
             equations.append(invs)
-    m: Matrix = cast(Matrix, nsolve(equations, syms, (0,) * (len(potentials) + len(currents) + len(aux_vars))))
+    m: Matrix = cast(Matrix, nsolve(equations, syms, tuple([start_factor * k for k in range(len(syms))]) if start_factor else ((0,) * len(syms))))
     return {syms[k]: m[k] for k in range(len(syms))}
 
 if __name__ == "__main__":
-    print("SELECT DEMO\n(1) Voltage source and resistance\n(2) NMOS linear\n(3) PMOS / RTKS 4.1\n(4) Diode w/ alternating source")
+    print("SELECT DEMO\n(1) Voltage source and resistance\n(2) NMOS linear\n(3) Diode w/ alternating source\n(4) PMOS / RTKS 4.1\n(5) NMOS / RTKS 4.2c")
     sel = input("> ")
     if sel == "1":
         Uq = VoltageSource("U").voltage(5)
@@ -274,7 +278,7 @@ if __name__ == "__main__":
             [ (R2, Resistor.T1), (R3, Resistor.T1), (GND, Ground.T), (Uq, VoltageSource.MINUS) ]
         ]
 
-        s = build(0, wires, Uq, R1, R2, R3, GND)  # pyright: ignore
+        s = simulate(0, wires, Uq, R1, R2, R3, GND)  # pyright: ignore
         print("I1: %.3gA, I2: %.3gA, I3: %.3gA" % (s[R1.currents[0]], s[R2.currents[0]], s[R3.currents[0]]))
     elif sel == "2":
         Uq1 = VoltageSource("Uq1").voltage(3)
@@ -288,9 +292,25 @@ if __name__ == "__main__":
             [ (Uq2, VoltageSource.PLUS), (T, NMOS.G) ]
         ]
 
-        s = build(0, wires, Uq1, Uq2, T, GND)  # pyright: ignore
+        s = simulate(0, wires, Uq1, Uq2, T, GND)  # pyright: ignore
         print("I_DS = %.3gA" % s[T.currents[0]])
     elif sel == "3":
+        Uq = VoltageSource("Uq").voltage(lambda t: 5 * cos(2 * pi * t))
+        R = Resistor("R").resistance(1000)
+        D = Diode("D").i_s(10e-21)
+        GND = Ground("GND")
+
+        wires = [
+            [ (Uq, VoltageSource.MINUS), (D, Diode.CATHODE), (GND, Ground.T) ],
+            [ (Uq, VoltageSource.PLUS), (R, Resistor.T0) ],
+            [ (R, Resistor.T1), (D, Diode.ANODE) ]
+        ]
+
+        s0 = simulate(0, wires, Uq, R, D, GND)  # pyright: ignore
+        s1 = simulate(0.5, wires, Uq, R, D, GND)  # pyright: ignore
+
+        print("I(0) = %.3gmA\nI(0.5s) = %.2eA" % (s0[D.currents[0]] * 1000, s1[D.currents[0]]))
+    elif sel == "4":
         Uq1 = VoltageSource("Uq1").voltage(3)
         UG = VoltageSource("UG").voltage(1)
         UD = VoltageSource("UD").voltage(2)
@@ -304,21 +324,24 @@ if __name__ == "__main__":
             [ (UG, VoltageSource.PLUS), (T, PMOS.G) ]
         ]
 
-        s = build(0, wires, Uq1, UG, UD, T, GND)  # pyright: ignore
+        s = simulate(0, wires, Uq1, UG, UD, T, GND)  # pyright: ignore
         print("I_D = %.3gmA" % (-s[T.currents[0]] * 1000))
-    elif sel == "4":
-        Uq = VoltageSource("Uq").voltage(lambda t: 5 * cos(2 * pi * t))
+    elif sel == "5":
+        RM = Symbol("RM", real=True)
+        M = Resistor("M").resistance(RM)  # pyright: ignore
+        Uq = VoltageSource("Uq").voltage(9)
+        UG = VoltageSource("UG").voltage(lambda t: 0 if t - t // 4 * 4 <= 2 else 5)
         R = Resistor("R").resistance(1000)
-        D = Diode("D").i_s(10e-21)
+        T = NMOS("T").mu0(1).c_ox(1).w_l(1).v_th(0.98).modulation(0.19)
         GND = Ground("GND")
 
         wires = [
-            [ (Uq, VoltageSource.MINUS), (D, Diode.CATHODE), (GND, Ground.T) ],
-            [ (Uq, VoltageSource.PLUS), (R, Resistor.T0) ],
-            [ (R, Resistor.T1), (D, Diode.ANODE) ]
+            [ (Uq, VoltageSource.MINUS), (UG, VoltageSource.MINUS), (R, Resistor.T1), (T, NMOS.S), (GND, Ground.T) ],
+            [ (Uq, VoltageSource.PLUS), (M, Resistor.T0) ],
+            [ (M, Resistor.T1), (T, NMOS.D) ],
+            [ (UG, VoltageSource.PLUS), (R, Resistor.T0), (T, NMOS.G) ]
         ]
 
-        s0 = build(0, wires, Uq, R, D, GND)  # pyright: ignore
-        s1 = build(0.5, wires, Uq, R, D, GND)  # pyright: ignore
+        s = simulate(3, wires, M, Uq, UG, R, T, GND, constraints=lambda:[Eq(T.currents[0], 0.12)], sym=[RM], start_factor=1)  # pyright: ignore
 
-        print("I(0) = %.3gmA\nI(0.5s) = %.2eA" % (s0[D.currents[0]] * 1000, s1[D.currents[0]]))
+        print("U_D = %.3gmV" % (s[T.potentials[NMOS.D]] * 1000))
