@@ -1,7 +1,8 @@
 from __future__ import annotations
 from abc import abstractmethod as abstract, ABC as Abstract
 from typing import Callable, Union, Any, cast
-from sympy import symbols, Symbol, Add, nsolve, Eq, Expr, Piecewise  # pyright: ignore
+from math import cos, pi
+from sympy import symbols, Symbol, Add, nsolve, Eq, Expr, Piecewise, exp  # pyright: ignore
 from sympy.core.relational import Relational
 from sympy.matrices import Matrix
 
@@ -107,6 +108,27 @@ class Ground(Component):
 
     def terminal_currents(self, t: int) -> list[number]:
         return [-1]
+
+class Diode(Component):
+    TERMNUM = 2
+    CURRNUM = 1
+    ANODE = 0
+    CATHODE = 1
+
+    def i_s(self, v: number):
+        self.settings["i_s"] = v
+        return self
+
+    def define(self, t: number):
+        # Shockley Diode.
+        ud: Expr = cast(Expr, self.potentials[Diode.ANODE] - self.potentials[Diode.CATHODE])
+        return cast(Relational, Eq(self.currents[0], self.settings["i_s"] * (exp(ud / 0.0025) - 1)))  # pyright: ignore
+
+    def terminal_currents(self, t: int) -> list[number]:
+        match t:
+            case Diode.ANODE: return [-1]
+            case Diode.CATHODE: return [1]
+            case _: raise ValueError()
 
 class NMOS(Component):
     TERMNUM = 3
@@ -237,7 +259,7 @@ def build(t: number, short: list[list[tuple[Component, int]]], *objects: Compone
     return {syms[k]: m[k] for k in range(len(syms))}
 
 if __name__ == "__main__":
-    print("SELECT DEMO\n(1) Voltage Source and Resistance\n(2) NMOS Linear\n(3) PMOS / RTKS 4.1")
+    print("SELECT DEMO\n(1) Voltage source and resistance\n(2) NMOS linear\n(3) PMOS / RTKS 4.1\n(4) Diode w/ alternating source")
     sel = input("> ")
     if sel == "1":
         Uq = VoltageSource("U").voltage(5)
@@ -253,7 +275,7 @@ if __name__ == "__main__":
         ]
 
         s = build(0, wires, Uq, R1, R2, R3, GND)  # pyright: ignore
-        print("I1: %.2e, I2: %.2e, I3: %.2e" % (s[R1.currents[0]], s[R2.currents[0]], s[R3.currents[0]]))
+        print("I1: %.3gA, I2: %.3gA, I3: %.3gA" % (s[R1.currents[0]], s[R2.currents[0]], s[R3.currents[0]]))
     elif sel == "2":
         Uq1 = VoltageSource("Uq1").voltage(3)
         Uq2 = VoltageSource("Uq2").voltage(5)
@@ -267,7 +289,7 @@ if __name__ == "__main__":
         ]
 
         s = build(0, wires, Uq1, Uq2, T, GND)  # pyright: ignore
-        print("I_DS = %.2e" % s[T.currents[0]])
+        print("I_DS = %.3gA" % s[T.currents[0]])
     elif sel == "3":
         Uq1 = VoltageSource("Uq1").voltage(3)
         UG = VoltageSource("UG").voltage(1)
@@ -283,4 +305,20 @@ if __name__ == "__main__":
         ]
 
         s = build(0, wires, Uq1, UG, UD, T, GND)  # pyright: ignore
-        print("I_D = %.2e" % -s[T.currents[0]])
+        print("I_D = %.3gmA" % (-s[T.currents[0]] * 1000))
+    elif sel == "4":
+        Uq = VoltageSource("Uq").voltage(lambda t: 5 * cos(2 * pi * t))
+        R = Resistor("R").resistance(1000)
+        D = Diode("D").i_s(10e-21)
+        GND = Ground("GND")
+
+        wires = [
+            [ (Uq, VoltageSource.MINUS), (D, Diode.CATHODE), (GND, Ground.T) ],
+            [ (Uq, VoltageSource.PLUS), (R, Resistor.T0) ],
+            [ (R, Resistor.T1), (D, Diode.ANODE) ]
+        ]
+
+        s0 = build(0, wires, Uq, R, D, GND)  # pyright: ignore
+        s1 = build(0.5, wires, Uq, R, D, GND)  # pyright: ignore
+
+        print("I(0) = %.3gmA\nI(0.5s) = %.2eA" % (s0[D.currents[0]] * 1000, s1[D.currents[0]]))
