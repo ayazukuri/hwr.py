@@ -1,9 +1,11 @@
 from __future__ import annotations
 from abc import abstractmethod as abstract, ABC as Abstract
-from typing import Callable, Union, Any
-import numpy as np
+from typing import Callable, Union, Any, cast
+from sympy import symbols, Symbol, Add, nsolve, Eq, Expr, Piecewise  # pyright: ignore
+from sympy.core.relational import Relational
+from sympy.matrices import Matrix
 
-number = float | int
+number = Union[float, int]
 
 class Component(Abstract):
     TERMNUM: int
@@ -12,20 +14,24 @@ class Component(Abstract):
     def __init__(self, name: str):
         self.name: str = name
         self.terminals: dict[str, int] = {}
-        self.id: int | None = None
+        self.id: Union[int, None] = None
         self.settings: dict[str, Any] = {}
-        self.potentials: list[int] = [-1] * self.TERMNUM
-        self.currents: list[int] = [-1] * self.CURRNUM
+        self.potentials: list[Symbol] = [Symbol("undefined")] * self.TERMNUM
+        self.currents: list[Symbol] = []
+        self.aux: list[Symbol] = []
     
     def set_id(self, i: int):
         self.id = i
+    
+    def init_aux_vars(self):
+        return self.aux
 
     @abstract
-    def null(self, t: number) -> list[tuple[Any, list[Any], list[Any]]]:
+    def define(self, t: number) -> list[Relational] | Relational:
         pass
 
     @abstract
-    def terminal_currents(self, ter: int) -> list[number]:
+    def terminal_currents(self, t: int) -> list[number]:
         pass
 
 class Resistor(Component):
@@ -34,20 +40,15 @@ class Resistor(Component):
     T0 = 0
     T1 = 1
 
-    def resistance(self, ohm: Callable[[number], number] | number):
-        if isinstance(ohm, number):
-            self.settings["resistance"] = lambda t: ohm  # type: ignore
-        else:
-            self.settings["resistance"] = ohm
+    def resistance(self, ohm: number):
+        self.settings["resistance"] = ohm
         return self
     
-    def null(self, t: number):
-        return [
-            (0, [1, -1], [-self.settings["resistance"](t)])
-        ]
+    def define(self, t: number) -> list[Relational] | Relational:
+        return cast(Relational, Eq(self.potentials[Resistor.T0], self.potentials[Resistor.T1] + self.currents[0] * self.settings["resistance"]))
     
-    def terminal_currents(self, ter: int) -> list[number]:
-        match ter:
+    def terminal_currents(self, t: int) -> list[number]:
+        match t:
             case Resistor.T0: return [-1]
             case Resistor.T1: return [1]
             case _: raise ValueError()
@@ -60,18 +61,16 @@ class VoltageSource(Component):
 
     def voltage(self, volt: Union[Callable[[number], number], number]):
         if isinstance(volt, number):
-            self.settings["voltage"] = lambda t: volt  # type: ignore
+            self.settings["voltage"] = lambda t: volt  # pyright: ignore
         else:
             self.settings["voltage"] = volt
         return self
 
-    def null(self, t: number):
-        return [
-            (self.settings["voltage"](t), [1, -1], [0])
-        ]
+    def define(self, t: number):
+        return cast(Relational, Eq(self.potentials[VoltageSource.PLUS], self.potentials[VoltageSource.MINUS] + self.settings["voltage"](t)))
     
-    def terminal_currents(self, ter: int) -> list[number]:
-        match ter:
+    def terminal_currents(self, t: int) -> list[number]:
+        match t:
             case VoltageSource.PLUS: return [1]
             case VoltageSource.MINUS: return [-1]
             case _: raise ValueError()
@@ -84,18 +83,16 @@ class CurrentSource(Component):
 
     def current(self, curr: Union[Callable[[number], number], number]):
         if isinstance(curr, number):
-            self.settings["current"] = lambda t: curr  # type: ignore
+            self.settings["current"] = lambda t: curr  # pyright: ignore
         else:
             self.settings["current"] = curr
         return self
 
-    def null(self, t: number):
-        return [
-            (self.settings["current"], [0, 0], [1])
-        ]
+    def define(self, t: number):
+        return cast(Relational, Eq(self.currents[0], self.settings["current"](t)))
 
-    def terminal_currents(self, ter: int) -> list[number]:
-        match ter:
+    def terminal_currents(self, t: int) -> list[number]:
+        match t:
             case CurrentSource.PLUS: return [1]
             case CurrentSource.MINUS: return [-1]
             case _: raise ValueError()
@@ -105,81 +102,185 @@ class Ground(Component):
     CURRNUM = 1
     T = 0
 
-    def null(self, t: number):
-        return [
-            (0, [1], [0])
-        ]
+    def define(self, t: number):
+        return cast(Relational, Eq(self.potentials[Ground.T], 0))
 
-    def terminal_currents(self, ter: number) -> list[number]:
+    def terminal_currents(self, t: int) -> list[number]:
         return [-1]
 
-"""
-def build(t: number, short: list[list[tuple[Component, int]]], *objects: Component):
+class NMOS(Component):
+    TERMNUM = 3
+    CURRNUM = 2
+    D = 0
+    S = 1
+    G = 2
+
+    def mu0(self, v: number):
+        self.settings["mu0"] = v
+        return self
+
+    def c_ox(self, v: number):
+        self.settings["c_ox"] = v
+        return self
+
+    def w_l(self, v: number):
+        self.settings["w/l"] = v
+        return self
+
+    def v_th(self, v: number):
+        self.settings["v_th"] = v
+        return self
+
+    def modulation(self, v: number):
+        self.settings["lambda"] = v
+        return self
+
+    def define(self, t: number):
+        vth = self.settings["v_th"]
+        uds: Expr = cast(Expr, self.potentials[NMOS.D] - self.potentials[NMOS.S])
+        ugs: Expr = cast(Expr, self.potentials[NMOS.G] - self.potentials[NMOS.S])
+        const = self.settings["mu0"] * self.settings["c_ox"] * self.settings["w/l"]
+        return [
+            cast(Relational, Eq(self.currents[0],
+                                Piecewise(
+                                    (0, ugs <= vth),
+                                    (const * ((ugs - vth) * uds - uds**2 / 2), uds < ugs - vth),
+                                    (0.5 * const * (ugs - vth)**2 * (1 + self.settings["lambda"] * (uds - ugs + vth)), True)
+                                )
+                               )),
+            cast(Relational, Eq(self.currents[1], 0))
+        ]
+
+    def terminal_currents(self, t: int) -> list[number]:
+        match t:
+            case NMOS.D: return [-1, 0]
+            case NMOS.S: return [1, 0]
+            case NMOS.G: return [0, 1]
+            case _: raise ValueError()
+
+class PMOS(Component):
+    TERMNUM = 3
+    CURRNUM = 2
+    D = 0
+    S = 1
+    G = 2
+
+    def mu0(self, v: number):
+        self.settings["mu0"] = v
+        return self
+
+    def c_ox(self, v: number):
+        self.settings["c_ox"] = v
+        return self
+
+    def w_l(self, v: number):
+        self.settings["w/l"] = v
+        return self
+
+    def v_th(self, v: number):
+        self.settings["v_th"] = v
+        return self
+
+    def modulation(self, v: number):
+        self.settings["lambda"] = v
+        return self
+
+    def define(self, t: number):
+        vth = self.settings["v_th"]
+        uds: Expr = cast(Expr, self.potentials[NMOS.D] - self.potentials[NMOS.S])
+        ugs: Expr = cast(Expr, self.potentials[NMOS.G] - self.potentials[NMOS.S])
+        const = self.settings["mu0"] * self.settings["c_ox"] * self.settings["w/l"]
+        return [
+            cast(Relational, Eq(-self.currents[0],
+                                Piecewise(
+                                    (0, ugs >= vth),
+                                    (const * ((ugs - vth) * uds - uds**2 / 2), uds > ugs - vth),
+                                    (0.5 * const * (ugs - vth)**2 * (1 + self.settings["lambda"] * (uds - ugs + vth)), True)
+                                )
+                               )),
+            cast(Relational, Eq(self.currents[1], 0))
+        ]
+
+    def terminal_currents(self, t: int) -> list[number]:
+        match t:
+            case NMOS.D: return [-1, 0]
+            case NMOS.S: return [1, 0]
+            case NMOS.G: return [0, 1]
+            case _: raise ValueError()
+
+def build(t: number, short: list[list[tuple[Component, int]]], *objects: Component) -> dict[Any, Any]:
     potentials = symbols(f"φ(1:{len(short) + 1})", real=True)
     currents = symbols(f"I(1:{sum(map(lambda cmp: cmp.CURRNUM, objects)) + 1})", real=True)
-    aux_vars = []
+    aux_vars: list[Symbol] = []
     c = 0
     for object in objects:
         aux_vars.extend(object.init_aux_vars())
         object.currents = currents[c:c + object.CURRNUM]
-        c += 1
-    equations = []
+        c += object.CURRNUM
+    syms = potentials + tuple(currents) + tuple(aux_vars)
+    equations: list[Relational] = []
     for var, s in enumerate(short):
-        node_equation = []
+        node_equation: list[Expr] = []
         for cmp, term in s:
             cmp.potentials[term] = potentials[var]
             cmp_currents = cmp.terminal_currents(term)
             for k in range(cmp.CURRNUM):
-                node_equation.append(cmp_currents[k] * cmp.currents[k])
-        equations.append(Add(*node_equation))
+                node_equation.append(cast(Expr, cmp_currents[k] * cmp.currents[k]))
+        equations.append(cast(Relational, Eq(Add(*node_equation), 0)))
     for object in objects:
-        equations.extend(object.invariants(t))
-    return solve(equations, potentials + tuple(currents) + tuple(aux_vars))
-"""
-def build(t: number, short: list[list[tuple[Component, int]]], *objects: Component):
-    n_pot = len(short)
-    n_cur = sum(map(lambda o: o.CURRNUM, objects))
-    n = n_pot + n_cur
-    c = 0
-    for object in objects:
-        object.currents = [n_pot + c + k for k in range(object.CURRNUM)]
-        c += object.CURRNUM
-    eq: Callable[[], list[number]] = lambda : [0] * n
-    equations: list[list[number]] = []
-    b: list[number] = [0] * len(short)
-    for potential, s in enumerate(short):
-        node_equation = eq()
-        for component, terminal in s:
-            component.potentials[terminal] = potential
-            polarization = component.terminal_currents(terminal)
-            for num, cur in enumerate(component.currents):
-                node_equation[cur] = polarization[num]
-        equations.append(node_equation)
-    for object in objects:
-        for const, pots, curs in object.null(t):
-            mesh_equation = eq()
-            b.append(const)
-            for pot, val in enumerate(pots):
-                mesh_equation[object.potentials[pot]] = val
-            for cur, val in enumerate(curs):
-                mesh_equation[object.currents[cur]] = val
-            equations.append(mesh_equation)
-    return np.linalg.solve(equations, b)
-
+        invs = object.define(t)
+        if isinstance(invs, list):
+            equations.extend(invs)
+        else:
+            equations.append(invs)
+    m: Matrix = cast(Matrix, nsolve(equations, syms, (0,) * (len(potentials) + len(currents) + len(aux_vars))))
+    return {syms[k]: m[k] for k in range(len(syms))}
 
 if __name__ == "__main__":
-    Uq = VoltageSource("U").voltage(5)
-    R1 = Resistor("R1").resistance(2)
-    R2 = Resistor("R2").resistance(10)
-    R3 = Resistor("R3").resistance(8)
-    GND = Ground("GND")
+    print("SELECT DEMO\n(1) Voltage Source and Resistance\n(2) NMOS Linear\n(3) PMOS / RTKS 4.1")
+    sel = input("> ")
+    if sel == "1":
+        Uq = VoltageSource("U").voltage(5)
+        R1 = Resistor("R1").resistance(2)
+        R2 = Resistor("R2").resistance(10)
+        R3 = Resistor("R3").resistance(8)
+        GND = Ground("GND")
 
-    wires = [
-        [ (Uq, VoltageSource.PLUS), (R1, Resistor.T0) ],
-        [ (R1, Resistor.T1), (R2, Resistor.T0), (R3, Resistor.T0) ],
-        [ (R2, Resistor.T1), (R3, Resistor.T1), (GND, Ground.T), (Uq, VoltageSource.MINUS) ]
-    ]
+        wires = [
+            [ (Uq, VoltageSource.PLUS), (R1, Resistor.T0) ],
+            [ (R1, Resistor.T1), (R2, Resistor.T0), (R3, Resistor.T0) ],
+            [ (R2, Resistor.T1), (R3, Resistor.T1), (GND, Ground.T), (Uq, VoltageSource.MINUS) ]
+        ]
 
-    sol = build(0, wires, Uq, R1, R2, R3, GND)
-    print(sol)
-    print(sol[Uq.currents[0]])
+        s = build(0, wires, Uq, R1, R2, R3, GND)  # pyright: ignore
+        print("I1: %.2e, I2: %.2e, I3: %.2e" % (s[R1.currents[0]], s[R2.currents[0]], s[R3.currents[0]]))
+    elif sel == "2":
+        Uq1 = VoltageSource("Uq1").voltage(3)
+        Uq2 = VoltageSource("Uq2").voltage(5)
+        T = NMOS("T").mu0(1).c_ox(1).w_l(1).v_th(1).modulation(0.19)
+        GND = Ground("GND")
+
+        wires = [
+            [ (Uq1, VoltageSource.MINUS), (Uq2, VoltageSource.MINUS), (T, NMOS.S), (GND, Ground.T) ],
+            [ (Uq1, VoltageSource.PLUS), (T, NMOS.D) ],
+            [ (Uq2, VoltageSource.PLUS), (T, NMOS.G) ]
+        ]
+
+        s = build(0, wires, Uq1, Uq2, T, GND)  # pyright: ignore
+        print("I_DS = %.2e" % s[T.currents[0]])
+    elif sel == "3":
+        Uq1 = VoltageSource("Uq1").voltage(3)
+        UG = VoltageSource("UG").voltage(1)
+        UD = VoltageSource("UD").voltage(2)
+        T = PMOS("T").mu0(250e-4).c_ox(0.34e-10/3.3e-9).w_l(25).v_th(-0.5).modulation(0.19)
+        GND = Ground("GND")
+
+        wires = [
+            [ (Uq1, VoltageSource.MINUS), (UG, VoltageSource.MINUS), (UD, VoltageSource.MINUS), (GND, Ground.T) ],
+            [ (UD, VoltageSource.PLUS), (T, PMOS.D) ],
+            [ (Uq1, VoltageSource.PLUS), (T, PMOS.S) ],
+            [ (UG, VoltageSource.PLUS), (T, PMOS.G) ]
+        ]
+
+        s = build(0, wires, Uq1, UG, UD, T, GND)  # pyright: ignore
+        print("I_D = %.2e" % -s[T.currents[0]])
